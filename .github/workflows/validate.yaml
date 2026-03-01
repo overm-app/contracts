@@ -1,0 +1,23 @@
+name: Validate contracts
+
+on:
+  pull_request:
+    paths:
+      - 'contracts/**.yaml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Spectral
+        run: npm install -g @stoplight/spectral-cli@6.11.0
+
+      - name: Validate OpenAPI specs
+        run: |
+          spectral lint contracts/user-auth-api.yaml
+          spectral lint contracts/user-auth-web.yaml
+          spectral lint contracts/recipe-catalog.yaml
+        #   spectral lint contracts/menu-shuffle.yaml
+        #   spectral lint contracts/nutrition.yaml
