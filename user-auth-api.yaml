@@ -1,0 +1,515 @@
+openapi: 3.0.3
+
+info:
+  title: overm-auth — API / Mobile Contract
+  description: |
+    Authentication contract for **mobile apps and API clients**.
+
+    Tokens are returned in the JSON response body. The client is responsible
+    for storing the access token securely in memory (not localStorage) and
+    including it in the `Authorization: Bearer <token>` header on every request.
+
+    > For **web browser clients** see `user-auth-web.yaml`.
+    > That contract uses HttpOnly cookies instead of Bearer tokens.
+
+    ---
+
+    ## JWT Contract (shared across all services)
+
+    Every service validates tokens **locally** using the shared `AUTH_JWT_SECRET`
+    environment variable. No network call is made per request.
+
+    JWT payload shape:
+    ```json
+    {
+      "sub":   "user-uuid",
+      "email": "user@example.com",
+      "name":  "Jane Smith",
+      "iat":   1730000000,
+      "exp":   1730086400
+    }
+    ```
+
+    Token lifetime: **24 hours**.
+    Refresh tokens live **30 days** and are stored in Postgres, rotated on each use.
+
+    ---
+
+    ## Google OAuth Flow (mobile / JSON mode)
+
+    1. App opens an in-app browser to `GET /auth/google?mode=json`
+    2. User approves on Google
+    3. Google redirects to `GET /auth/google/callback?code=...&mode=json`
+    4. Service exchanges code, creates/finds user, issues JWT
+    5. Returns `AuthResponse` JSON directly — **no redirect**
+
+  version: 1.0.0
+  contact:
+    name: Mario Irigoyen
+    url: https://github.com/Tar-Mairon24/overm-auth
+
+servers:
+  - url: http://user-auth-svc:8081
+    description: Internal Kubernetes cluster DNS
+  - url: http://localhost:8081
+    description: Local docker-compose
+
+tags:
+  - name: Auth - Local
+    description: Email and password authentication
+  - name: Auth - Google OAuth
+    description: Google OAuth 2.0 flow
+  - name: Users
+    description: Authenticated user profile
+  - name: Internal
+    description: Internal endpoints — not exposed via ALB Ingress
+
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Include the access_token from AuthResponse in every request:
+        `Authorization: Bearer <access_token>`
+
+  schemas:
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: INVALID_CREDENTIALS
+          description: Machine-readable error code — same shape across all OVERM services
+        message:
+          type: string
+          description: Human-readable description
+        details:
+          type: object
+          additionalProperties: true
+          description: Optional extra context (validation field errors, etc.)
+
+    User:
+      type: object
+      required: [id, email, name, auth_provider, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: |
+            UUID v7 — time-ordered for index-friendly insertion in PostgreSQL.
+            Used as the JWT `sub` claim and in all cross-service references.
+          example: 018e1b3c-4f9a-7c2d-b1e8-3a9f6d012345
+        email:
+          type: string
+          format: email
+          example: jane@example.com
+        name:
+          type: string
+          example: Jane Smith
+        auth_provider:
+          type: string
+          enum: [local, google]
+          description: How this user originally signed up
+        avatar_url:
+          type: string
+          nullable: true
+          description: Profile picture URL — populated from Google for OAuth users
+          example: https://lh3.googleusercontent.com/a/abc123
+        created_at:
+          type: string
+          format: date-time
+
+    AuthResponse:
+      type: object
+      required: [access_token, refresh_token, user]
+      description: |
+        Returned on successful login, register, or token refresh.
+        Store `access_token` in memory. Store `refresh_token` securely.
+        Never store either in localStorage.
+      properties:
+        access_token:
+          type: string
+          description: Short-lived JWT (24h). Include in Authorization header.
+        refresh_token:
+          type: string
+          description: Long-lived token (30 days). Use to get a new access_token.
+        user:
+          $ref: '#/components/schemas/User'
+
+    RegisterRequest:
+      type: object
+      required: [email, password, name]
+      properties:
+        email:
+          type: string
+          format: email
+          example: jane@example.com
+        password:
+          type: string
+          minLength: 8
+          description: Hashed with bcrypt server-side. Never stored plain.
+          example: mysecurepassword
+        name:
+          type: string
+          minLength: 1
+          example: Jane Smith
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          description: The refresh_token received from a previous AuthResponse
+
+paths:
+
+  # ───────────────────────────────────────────────────────
+  # Email / password auth
+  # ───────────────────────────────────────────────────────
+
+  /auth/v1/register:
+    post:
+      summary: Register a new user with email and password
+      operationId: register
+      tags: [Auth - Local]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              email: jane@example.com
+              password: mysecurepassword
+              name: Jane Smith
+      responses:
+        '201':
+          description: User created and logged in
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: VALIDATION_ERROR
+                message: Password must be at least 8 characters
+                details:
+                  field: password
+        '409':
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: EMAIL_ALREADY_EXISTS
+                message: An account with this email already exists
+
+  /auth/v1/login:
+    post:
+      summary: Log in with email and password
+      operationId: login
+      tags: [Auth - Local]
+      description: |
+        Returns the same error message whether the email doesn't exist
+        or the password is wrong — prevents user enumeration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Wrong credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_CREDENTIALS
+                message: Email or password is incorrect
+
+  /auth/v1/refresh:
+    post:
+      summary: Exchange a refresh token for a new access token
+      operationId: refreshToken
+      tags: [Auth - Local]
+      description: |
+        Refresh tokens are rotated on every use — the old token is invalidated
+        and a new one is returned. Do not reuse a refresh token after calling this.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New tokens issued, old refresh token invalidated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Refresh token invalid, expired, or already used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_REFRESH_TOKEN
+                message: Refresh token is expired or has been revoked
+
+  /auth/v1/logout:
+    post:
+      summary: Invalidate the current refresh token
+      operationId: logout
+      tags: [Auth - Local]
+      security:
+        - BearerAuth: []
+      description: |
+        Deletes the refresh token from Postgres. The access token remains valid
+        until expiry (24h) — there is no server-side access token blocklist.
+        Clients must discard the access token themselves on logout.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '204':
+          description: Logged out — refresh token revoked
+        '401':
+          description: Not authenticated
+
+  # ───────────────────────────────────────────────────────
+  # Google OAuth — mobile / JSON mode
+  # ───────────────────────────────────────────────────────
+
+  /auth/v1/google:
+    get:
+      summary: Start Google OAuth flow
+      operationId: googleOAuthStart
+      tags: [Auth - Google OAuth]
+      description: |
+        Redirects the client to Google's consent screen.
+
+        For mobile apps, open this URL in an in-app browser.
+        Always pass `mode=json` so the callback returns JSON instead of a redirect.
+
+        A random `state` parameter is generated server-side and stored in a
+        short-lived server session to prevent CSRF on the callback.
+      parameters:
+        - name: mode
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [json]
+            default: json
+          description: Mobile clients must always send `mode=json`
+        - name: redirect_after
+          in: query
+          description: Deep link or screen to navigate to after successful auth
+          schema:
+            type: string
+            example: overm://dashboard
+      responses:
+        '302':
+          description: Redirect to Google consent screen
+
+  /auth/v1/google/callback:
+    get:
+      summary: Google OAuth callback — called by Google after user approves
+      operationId: googleOAuthCallback
+      tags: [Auth - Google OAuth]
+      description: |
+        Google redirects here with a `code` after user approval.
+
+        The service:
+        1. Validates the `state` param (CSRF protection)
+        2. Exchanges `code` for Google tokens server-to-server
+        3. Calls Google's userinfo endpoint for email, name, avatar
+        4. Upserts user in Postgres (`ON CONFLICT (email) DO UPDATE`)
+        5. Issues JWT + refresh token
+        6. Returns `AuthResponse` JSON (because `mode=json`)
+
+        **Note:** Google users cannot log in with email/password and vice versa.
+        If a Google email matches an existing local account, returns 409.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Authorization code from Google — single use, short-lived
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Must match the state generated during /auth/v1/google
+        - name: mode
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [json]
+      responses:
+        '200':
+          description: Auth successful — tokens returned as JSON
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          description: Invalid or expired OAuth code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: OAUTH_CODE_INVALID
+                message: The OAuth authorization code is invalid or has expired
+        '409':
+          description: Email already registered with a different auth provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: AUTH_PROVIDER_CONFLICT
+                message: This email is already registered with email and password
+
+  # ───────────────────────────────────────────────────────
+  # User profile
+  # ───────────────────────────────────────────────────────
+
+  /users/v1/me:
+    get:
+      summary: Get the authenticated user's profile
+      operationId: getMe
+      tags: [Users]
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Authenticated user's profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: UNAUTHORIZED
+                message: No valid token provided
+
+  # ───────────────────────────────────────────────────────
+  # Internal endpoints — not exposed through ALB Ingress
+  # ───────────────────────────────────────────────────────
+
+  /auth/v1/validate:
+    post:
+      summary: Validate a JWT and return its claims (internal / debug only)
+      operationId: validateToken
+      tags: [Internal]
+      description: |
+        Services validate tokens **locally** using `AUTH_JWT_SECRET`.
+        This endpoint is a fallback for debugging only.
+
+        **Do not call this on the hot path** — it defeats the point of JWTs.
+        It exists so you can curl it during development to inspect a token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token:
+                  type: string
+      responses:
+        '200':
+          description: Token is valid — claims returned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sub:
+                    type: string
+                    format: uuid
+                  email:
+                    type: string
+                  name:
+                    type: string
+                  iat:
+                    type: integer
+                  exp:
+                    type: integer
+        '401':
+          description: Token invalid or expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: TOKEN_INVALID
+                message: Token signature is invalid or token has expired
+
+  /healthz:
+    get:
+      summary: Kubernetes liveness probe
+      operationId: healthCheck
+      tags: [Internal]
+      security: []
+      description: Returns 200 if the service is up. No auth required.
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: overm-auth

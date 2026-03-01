@@ -1,0 +1,229 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Kafka Message Contracts
+#
+# These are NOT OpenAPI — Kafka is async so there are no HTTP requests/responses.
+# Instead, each "topic" section defines:
+#   - who PRODUCES (publishes) the message
+#   - who CONSUMES (reads) the message
+#   - the exact JSON shape of the message payload
+#
+# RULE: Every message must have an event_id and timestamp at the top level.
+# This lets you deduplicate events if a consumer crashes and re-reads.
+# ─────────────────────────────────────────────────────────────────────────────
+
+topics:
+
+  # ───────────────────────────────────────────────
+  # TOPIC: recipe.image.uploaded
+  # Produced by: RecipeCatalog (or a future Upload service)
+  # Consumed by: AIImageProcessing
+  #
+  # Triggered when a user uploads a photo or scan of a handwritten recipe.
+  # AIImageProcessing will pick this up, transcribe it, then publish
+  # to recipe.transcription.completed.
+  # ───────────────────────────────────────────────
+  recipe.image.uploaded:
+    producer: RecipeCatalog
+    consumer: AIImageProcessing
+    message:
+      type: object
+      required: [event_id, timestamp, user_id, image_url, upload_id]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Unique ID for this event — used for deduplication
+          example: "a1b2c3d4-0000-0000-0000-000000000001"
+        timestamp:
+          type: string
+          format: date-time
+          example: "2024-11-01T14:30:00Z"
+        user_id:
+          type: string
+          format: uuid
+          description: The user who uploaded the image
+        upload_id:
+          type: string
+          format: uuid
+          description: |
+            ID of this specific upload attempt. 
+            Returned to the frontend so the user can poll for status.
+        image_url:
+          type: string
+          description: |
+            S3 pre-signed URL or internal path to the uploaded image.
+            AIImageProcessing will fetch the image from here.
+          example: "https://s3.amazonaws.com/your-bucket/uploads/abc123.jpg"
+        hint:
+          type: string
+          description: Optional user-provided hint to help transcription (e.g. "this is in Spanish")
+          example: "handwritten, spanish, my mom's cursive"
+
+    example_payload: |
+      {
+        "event_id": "a1b2c3d4-0000-0000-0000-000000000001",
+        "timestamp": "2024-11-01T14:30:00Z",
+        "user_id": "user-uuid-here",
+        "upload_id": "upload-uuid-here",
+        "image_url": "https://s3.amazonaws.com/bucket/uploads/abc123.jpg",
+        "hint": "handwritten, spanish, my mom's cursive"
+      }
+
+
+  # ───────────────────────────────────────────────
+  # TOPIC: recipe.transcription.completed
+  # Produced by: AIImageProcessing
+  # Consumed by: RecipeCatalog
+  #
+  # Published after AI successfully transcribes a recipe image.
+  # RecipeCatalog uses this to automatically create a new Recipe
+  # document for the user, marked with source: "transcribed".
+  # ───────────────────────────────────────────────
+  recipe.transcription.completed:
+    producer: AIImageProcessing
+    consumer: RecipeCatalog
+    message:
+      type: object
+      required: [event_id, timestamp, upload_id, user_id, status]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+        upload_id:
+          type: string
+          format: uuid
+          description: Matches the upload_id from recipe.image.uploaded — links the result back to the request
+        user_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [success, failed]
+          description: |
+            "success" means transcription worked and recipe_data is populated.
+            "failed" means something went wrong — check error_message.
+        recipe_data:
+          type: object
+          description: Only present when status is "success"
+          properties:
+            title:
+              type: string
+              example: "Pollo en salsa verde de mi mamá"
+            ingredients:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  quantity:
+                    type: number
+                  unit:
+                    type: string
+                  raw_text:
+                    type: string
+                    description: |
+                      The original transcribed text for this ingredient before parsing.
+                      Useful for showing the user what the AI read if parsing was uncertain.
+            steps:
+              type: array
+              items:
+                type: string
+            servings:
+              type: integer
+            confidence_score:
+              type: number
+              format: float
+              minimum: 0
+              maximum: 1
+              description: |
+                How confident the model is in the overall transcription.
+                Below 0.7 you might want to flag the recipe for manual user review.
+              example: 0.85
+        error_message:
+          type: string
+          description: Only present when status is "failed"
+          example: "Image quality too low to transcribe"
+
+    example_payload_success: |
+      {
+        "event_id": "b2c3d4e5-0000-0000-0000-000000000002",
+        "timestamp": "2024-11-01T14:31:05Z",
+        "upload_id": "upload-uuid-here",
+        "user_id": "user-uuid-here",
+        "status": "success",
+        "recipe_data": {
+          "title": "Pollo en salsa verde de mi mamá",
+          "ingredients": [
+            { "name": "chicken", "quantity": 1, "unit": "kg", "raw_text": "1 kilo de pollo" },
+            { "name": "tomatillo", "quantity": 500, "unit": "g", "raw_text": "1/2 kg de tomate verde" }
+          ],
+          "steps": [
+            "Boil the chicken until cooked through",
+            "Blend tomatillos with chile and garlic"
+          ],
+          "servings": 4,
+          "confidence_score": 0.85
+        }
+      }
+
+    example_payload_failed: |
+      {
+        "event_id": "c3d4e5f6-0000-0000-0000-000000000003",
+        "timestamp": "2024-11-01T14:31:10Z",
+        "upload_id": "upload-uuid-here",
+        "user_id": "user-uuid-here",
+        "status": "failed",
+        "error_message": "Image quality too low to transcribe"
+      }
+
+
+  # ───────────────────────────────────────────────
+  # TOPIC: notification.send
+  # Produced by: RecipeCatalog, MenuShuffle (any service)
+  # Consumed by: Email/Notification service
+  #
+  # Generic notification request. The notification service
+  # decides HOW to deliver it (email, push, etc.)
+  # ───────────────────────────────────────────────
+  notification.send:
+    producer: any service
+    consumer: Email/Notification
+    message:
+      type: object
+      required: [event_id, timestamp, user_id, type]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+        user_id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [transcription_complete, transcription_failed, menu_ready, welcome]
+          description: The notification service uses this to pick the right email template
+        payload:
+          type: object
+          description: |
+            Type-specific data for the template. 
+            Examples below per type.
+          additionalProperties: true
+
+    example_payload: |
+      {
+        "event_id": "d4e5f6a7-0000-0000-0000-000000000004",
+        "timestamp": "2024-11-01T14:31:06Z",
+        "user_id": "user-uuid-here",
+        "type": "transcription_complete",
+        "payload": {
+          "recipe_title": "Pollo en salsa verde de mi mamá",
+          "recipe_id": "new-recipe-uuid"
+        }
+      }

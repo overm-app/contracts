@@ -1,0 +1,528 @@
+openapi: 3.0.3
+
+info:
+  title: overm-auth — Web Browser Contract
+  description: |
+    Authentication contract for **web browser clients only**.
+
+    Tokens are **never returned in the response body**.
+    Instead the server sets `HttpOnly` cookies that JavaScript cannot read.
+    The browser attaches them automatically on every request to the same domain.
+
+    > For **mobile apps and API clients** see `user-auth-api.yaml`.
+    > That contract uses Bearer JWT in the response body.
+
+    ---
+
+    ## Why HttpOnly cookies for the browser?
+
+    JWTs stored in `localStorage` are readable by any JavaScript on the page,
+    including scripts injected via XSS. HttpOnly cookies are inaccessible to
+    JavaScript entirely — only the browser sends them, and only to your domain.
+
+    ---
+
+    ## Cookies set on successful auth
+
+    | Cookie | HttpOnly | Secure | Path | MaxAge |
+    |---|---|---|---|---|
+    | `overm_access_token` | ✅ | ✅ | `/` | 24h |
+    | `overm_refresh_token` | ✅ | ✅ | `/auth/v1/refresh` | 30d |
+    | `overm_csrf_token` | ❌ | ✅ | `/` | 24h |
+
+    The `overm_csrf_token` is readable by JavaScript intentionally.
+    Your frontend must read it and send it back as `X-CSRF-Token` header
+    on every mutating request (POST, PATCH, DELETE).
+    A third-party site cannot do this because it cannot read your cookies.
+
+    ---
+
+    ## CSRF Protection
+
+    All mutating endpoints require the `X-CSRF-Token` header.
+    The value must match the `overm_csrf_token` cookie.
+
+    GET requests are exempt — they don't mutate state.
+
+    ---
+
+    ## Google OAuth Flow (browser / redirect mode)
+
+    1. Frontend redirects user to `GET /auth/v1/google` (no mode param needed)
+    2. User approves on Google
+    3. Google redirects to `GET /auth/v1/google/callback`
+    4. Service exchanges code, creates/finds user, issues JWT
+    5. Sets HttpOnly cookies on the response
+    6. Redirects browser to frontend — **no token in the URL ever**
+
+    ---
+
+    ## Session Refresh
+
+    The browser automatically sends `overm_refresh_token` when it calls
+    `POST /auth/v1/refresh` because the cookie path is `/auth/v1/refresh`.
+    No request body needed — the cookie is the credential.
+
+  version: 1.0.0
+  contact:
+    name: Mario Irigoyen
+    url: https://github.com/Tar-Mairon24/overm-auth
+
+servers:
+  - url: http://user-auth-svc:8081
+    description: Internal Kubernetes cluster DNS
+  - url: http://localhost:8081
+    description: Local docker-compose
+
+tags:
+  - name: Auth - Local
+    description: Email and password authentication
+  - name: Auth - Google OAuth
+    description: Google OAuth 2.0 flow — browser redirect mode
+  - name: Users
+    description: Authenticated user profile
+  - name: Internal
+    description: Internal endpoints — not exposed via ALB Ingress
+
+components:
+
+  schemas:
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          example: INVALID_CREDENTIALS
+          description: Machine-readable error code — same shape across all OVERM services
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+    User:
+      type: object
+      required: [id, email, name, auth_provider, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 018e1b3c-4f9a-7c2d-b1e8-3a9f6d012345
+        email:
+          type: string
+          format: email
+          example: jane@example.com
+        name:
+          type: string
+          example: Jane Smith
+        auth_provider:
+          type: string
+          enum: [local, google]
+        avatar_url:
+          type: string
+          nullable: true
+          example: https://lh3.googleusercontent.com/a/abc123
+        created_at:
+          type: string
+          format: date-time
+
+    WebAuthResponse:
+      type: object
+      required: [user]
+      description: |
+        Returned on successful login, register, or token refresh.
+
+        **There is no token in this response body.**
+        Tokens are delivered via HttpOnly cookies in the Set-Cookie header.
+        The frontend only receives the user object — it never touches a JWT.
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+
+    RegisterRequest:
+      type: object
+      required: [email, password, name]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+          description: Hashed with bcrypt server-side. Never stored plain.
+        name:
+          type: string
+          minLength: 1
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    CsrfTokenResponse:
+      type: object
+      required: [csrf_token]
+      description: |
+        A fresh CSRF token. Also set as the `overm_csrf_token` cookie.
+        Use this if the cookie has expired or on initial page load.
+      properties:
+        csrf_token:
+          type: string
+          description: Include this as the `X-CSRF-Token` header on all mutating requests
+
+  # CSRF header required on all mutating endpoints
+  parameters:
+    CsrfHeader:
+      name: X-CSRF-Token
+      in: header
+      required: true
+      schema:
+        type: string
+      description: |
+        Value of the `overm_csrf_token` cookie.
+        Read it with JavaScript and send it back in this header.
+        Required on POST, PATCH, DELETE. Not required on GET.
+
+  # Cookie-based auth — described in headers, not securitySchemes,
+  # because OpenAPI 3.0 doesn't model HttpOnly cookies well.
+  # Auth is implicit: the browser sends the overm_access_token cookie automatically.
+
+paths:
+
+  # ───────────────────────────────────────────────────────
+  # CSRF token
+  # ───────────────────────────────────────────────────────
+
+  /auth/v1/csrf:
+    get:
+      summary: Get a fresh CSRF token
+      operationId: getCsrfToken
+      tags: [Auth - Local]
+      description: |
+        Returns a new CSRF token as both a JSON response and a cookie.
+        Call this on initial page load if the `overm_csrf_token` cookie
+        is missing or expired.
+
+        This is a GET — no CSRF header required.
+      responses:
+        '200':
+          description: Fresh CSRF token
+          headers:
+            Set-Cookie:
+              description: Sets `overm_csrf_token` (NOT HttpOnly — JS must read it)
+              schema:
+                type: string
+                example: overm_csrf_token=abc123; Secure; SameSite=Strict; Path=/
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CsrfTokenResponse'
+
+  # ───────────────────────────────────────────────────────
+  # Email / password auth
+  # ───────────────────────────────────────────────────────
+
+  /auth/v1/register:
+    post:
+      summary: Register a new user with email and password
+      operationId: registerWeb
+      tags: [Auth - Local]
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              email: jane@example.com
+              password: mysecurepassword
+              name: Jane Smith
+      responses:
+        '201':
+          description: User created and logged in — tokens set as HttpOnly cookies
+          headers:
+            Set-Cookie:
+              description: |
+                Three cookies are set:
+                - `overm_access_token` (HttpOnly, 24h)
+                - `overm_refresh_token` (HttpOnly, 30d, path=/auth/v1/refresh)
+                - `overm_csrf_token` (readable by JS, 24h)
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebAuthResponse'
+        '400':
+          description: Validation error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: VALIDATION_ERROR
+                message: Password must be at least 8 characters
+                details:
+                  field: password
+        '409':
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: EMAIL_ALREADY_EXISTS
+                message: An account with this email already exists
+
+  /auth/v1/login:
+    post:
+      summary: Log in with email and password
+      operationId: loginWeb
+      tags: [Auth - Local]
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      description: |
+        Returns the same error whether the email doesn't exist or the password
+        is wrong — prevents user enumeration.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful — tokens set as HttpOnly cookies
+          headers:
+            Set-Cookie:
+              description: Sets overm_access_token, overm_refresh_token, overm_csrf_token
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebAuthResponse'
+        '401':
+          description: Wrong credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_CREDENTIALS
+                message: Email or password is incorrect
+
+  /auth/v1/refresh:
+    post:
+      summary: Refresh the access token using the refresh cookie
+      operationId: refreshTokenWeb
+      tags: [Auth - Local]
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      description: |
+        **No request body needed.**
+
+        The browser automatically sends the `overm_refresh_token` cookie
+        because this endpoint matches the cookie's path (`/auth/v1/refresh`).
+
+        The old refresh token is invalidated and a new one is set via cookie.
+        Refresh tokens are rotated on every use.
+      responses:
+        '200':
+          description: New access token set as cookie — old refresh token invalidated
+          headers:
+            Set-Cookie:
+              description: Sets new overm_access_token and overm_refresh_token cookies
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WebAuthResponse'
+        '401':
+          description: Refresh token cookie missing, expired, or already used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_REFRESH_TOKEN
+                message: Refresh token is expired or has been revoked
+
+  /auth/v1/logout:
+    post:
+      summary: Log out — clear all auth cookies and revoke refresh token
+      operationId: logoutWeb
+      tags: [Auth - Local]
+      parameters:
+        - $ref: '#/components/parameters/CsrfHeader'
+      description: |
+        **No request body needed.**
+
+        Clears all three cookies by setting them with `MaxAge=0`.
+        Also deletes the refresh token from Postgres.
+
+        The access token remains cryptographically valid until expiry (24h)
+        but the browser no longer has it — no blocklist needed.
+      responses:
+        '204':
+          description: Logged out — all cookies cleared, refresh token revoked
+          headers:
+            Set-Cookie:
+              description: All three cookies cleared (MaxAge=0)
+              schema:
+                type: string
+        '401':
+          description: Not authenticated — no valid session cookie
+
+  # ───────────────────────────────────────────────────────
+  # Google OAuth — browser redirect mode
+  # ───────────────────────────────────────────────────────
+
+  /auth/v1/google:
+    get:
+      summary: Start Google OAuth flow — browser redirect
+      operationId: googleOAuthStartWeb
+      tags: [Auth - Google OAuth]
+      description: |
+        Redirects the browser to Google's consent screen.
+
+        A random `state` value is generated and stored in a short-lived
+        server-side session or signed cookie to prevent CSRF on the callback.
+
+        No `mode` parameter here — the web contract always uses redirect mode.
+      parameters:
+        - name: redirect_after
+          in: query
+          description: Frontend path to redirect to after successful auth
+          schema:
+            type: string
+            example: /dashboard
+      responses:
+        '302':
+          description: Redirect to Google consent screen
+
+  /auth/v1/google/callback:
+    get:
+      summary: Google OAuth callback — sets cookies, redirects browser
+      operationId: googleOAuthCallbackWeb
+      tags: [Auth - Google OAuth]
+      description: |
+        Google redirects here after user approval.
+
+        The service:
+        1. Validates the `state` param (CSRF protection)
+        2. Exchanges `code` for Google tokens (server-to-server)
+        3. Calls Google's userinfo endpoint for email, name, avatar
+        4. Upserts user in Postgres (`ON CONFLICT (email) DO UPDATE`)
+        5. Issues JWT and refresh token
+        6. Sets all three cookies on the response
+        7. Redirects browser to the original `redirect_after` path
+
+        **The token never appears in the URL.**
+        Unlike the mobile flow, there is no `?token=` in the redirect.
+
+        **Note:** If a Google email matches an existing local account, returns 409.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '302':
+          description: |
+            Auth successful — cookies set, browser redirected to frontend.
+            Example redirect target: `https://overm.app/dashboard`
+          headers:
+            Set-Cookie:
+              description: Sets overm_access_token, overm_refresh_token, overm_csrf_token
+              schema:
+                type: string
+        '400':
+          description: Invalid or expired OAuth code
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: OAUTH_CODE_INVALID
+                message: The OAuth authorization code is invalid or has expired
+        '409':
+          description: Email already registered with a different auth provider
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: AUTH_PROVIDER_CONFLICT
+                message: This email is already registered with email and password
+
+  # ───────────────────────────────────────────────────────
+  # User profile
+  # ───────────────────────────────────────────────────────
+
+  /users/v1/me:
+    get:
+      summary: Get the authenticated user's profile
+      operationId: getMeWeb
+      tags: [Users]
+      description: |
+        Auth is via the `overm_access_token` cookie — sent automatically by the browser.
+        No Authorization header needed.
+      responses:
+        '200':
+          description: Authenticated user's profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          description: Session cookie missing or expired
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: UNAUTHORIZED
+                message: Session expired — please log in again
+
+  # ───────────────────────────────────────────────────────
+  # Internal
+  # ───────────────────────────────────────────────────────
+
+  /healthz:
+    get:
+      summary: Kubernetes liveness probe
+      operationId: healthCheckWeb
+      tags: [Internal]
+      security: []
+      description: Returns 200 if the service is up. No auth required.
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: overm-auth

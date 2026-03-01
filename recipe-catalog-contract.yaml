@@ -1,0 +1,697 @@
+openapi: 3.0.3
+
+info:
+  title: overm-recipe-catalog
+  description: |
+    Manages the authenticated user's recipe library.
+
+    Supports manual recipe creation with immediate macro calculation,
+    partial updates, soft deletes, and paginated search.
+
+    Transcribed recipes from image processing arrive via Kafka —
+    not through this HTTP API. See `kafka-contracts.yaml` for that message shape.
+
+    ---
+
+    ## Auth
+
+    All endpoints require a valid JWT issued by `overm-auth`.
+    Tokens are validated **locally** using the shared `AUTH_JWT_SECRET` —
+    no network call to overm-auth per request.
+
+    The `user_id` on every recipe is extracted from the JWT `sub` claim.
+    Users can only read and modify their own recipes — enforced server-side,
+    not just by filtering.
+
+    ---
+
+    ## Soft Deletes
+
+    Recipes are never hard-deleted. `DELETE /recipes/v1/:id` sets
+    `status: archived`. This preserves history for future analytics
+    (most cooked recipe, weekly calorie trends, etc).
+
+    Archived recipes are excluded from all list and search responses
+    unless `include_archived=true` is passed.
+
+    ---
+
+    ## Macro Calculation
+
+    When a recipe is created or its ingredients are updated, this service
+    calls `overm-nutrition` synchronously before returning the response.
+    The `macros_per_serving` field is always populated on a `201` or `200`.
+
+    If the nutrition call fails, the recipe is still saved but
+    `macros_per_serving` will be `null` and the response includes a warning.
+
+  version: 1.0.0
+  contact:
+    name: Mario Irigoyen
+    url: https://github.com/Tar-Mairon24/overm-recipe-catalog
+
+servers:
+  - url: http://recipe-catalog-svc:8082
+    description: Internal Kubernetes cluster DNS
+  - url: http://localhost:8082
+    description: Local docker-compose
+
+tags:
+  - name: Recipes
+    description: Recipe CRUD operations
+  - name: Upload
+    description: Image upload for transcription
+  - name: Internal
+    description: Internal endpoints — not exposed via ALB Ingress
+
+security:
+  - BearerAuth: []
+
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT issued by overm-auth. Validated locally using `AUTH_JWT_SECRET`.
+
+        Expected claims:
+        ```
+        sub    (string uuid)  — user ID, used as recipe owner
+        email  (string)       — user email
+        iat    (number)       — issued at (unix)
+        exp    (number)       — expiry (unix)
+        ```
+
+  schemas:
+
+    Error:
+      type: object
+      required: [code, message]
+      description: Standard error shape — same across all OVERM services
+      properties:
+        code:
+          type: string
+          description: Machine-readable error code
+          example: RECIPE_NOT_FOUND
+        message:
+          type: string
+          description: Human-readable explanation
+          example: No recipe with id 'abc-123' was found for this user
+        details:
+          type: object
+          description: Optional extra context — validation field errors, etc.
+          additionalProperties: true
+
+    Ingredient:
+      type: object
+      required: [name, quantity, unit]
+      properties:
+        name:
+          type: string
+          example: Chicken breast
+        quantity:
+          type: number
+          format: float
+          example: 200
+        unit:
+          type: string
+          description: g · kg · ml · l · cups · tbsp · tsp · units
+          example: g
+
+    Macros:
+      type: object
+      description: |
+        Calculated by overm-nutrition and stored denormalized on the recipe.
+        Always per serving. Null until calculation completes — possible if
+        the nutrition service was unreachable at creation time.
+      nullable: true
+      properties:
+        calories:
+          type: number
+          format: float
+          example: 330.5
+        protein_g:
+          type: number
+          format: float
+          example: 62.0
+        carbs_g:
+          type: number
+          format: float
+          example: 0.0
+        fat_g:
+          type: number
+          format: float
+          example: 7.2
+        fiber_g:
+          type: number
+          format: float
+          example: 0.0
+
+    Recipe:
+      type: object
+      required: [id, user_id, title, ingredients, steps, servings, status, source, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: UUID v7 — time-ordered for index-friendly insertion
+          example: 018e1b3c-4f9a-7c2d-b1e8-3a9f6d012345
+        user_id:
+          type: string
+          format: uuid
+          description: Recipe owner — extracted from JWT sub claim, never from request body
+          example: 018e1b3c-4f9a-7c2d-b1e8-3a9f6d099999
+        title:
+          type: string
+          example: Grilled chicken with veggies
+        description:
+          type: string
+          nullable: true
+          example: Quick high-protein meal
+        ingredients:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Ingredient'
+        steps:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          example:
+            - Season chicken breast with salt and pepper
+            - Grill on medium heat for 6 minutes each side
+        servings:
+          type: integer
+          minimum: 1
+          example: 2
+        tags:
+          type: array
+          items:
+            type: string
+          example: [high-protein, quick, gluten-free]
+        macros_per_serving:
+          $ref: '#/components/schemas/Macros'
+        status:
+          type: string
+          enum: [active, archived]
+          description: |
+            Recipes are never hard-deleted.
+            archived = soft-deleted, excluded from list responses by default.
+          example: active
+        source:
+          type: string
+          enum: [manual, transcribed]
+          description: |
+            manual = typed by user via POST /recipes/v1
+            transcribed = arrived via Kafka from overm-image-processing
+          example: manual
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    RecipeListResponse:
+      type: object
+      required: [data, total, page, page_size]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Recipe'
+        total:
+          type: integer
+          description: Total recipes matching the query — use for pagination UI
+          example: 42
+        page:
+          type: integer
+          example: 1
+        page_size:
+          type: integer
+          example: 20
+
+    CreateRecipeRequest:
+      type: object
+      required: [title, ingredients, steps, servings]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          example: Grilled chicken with veggies
+        description:
+          type: string
+        ingredients:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Ingredient'
+        steps:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        servings:
+          type: integer
+          minimum: 1
+        tags:
+          type: array
+          items:
+            type: string
+
+    UpdateRecipeRequest:
+      type: object
+      description: |
+        All fields optional — only provided fields are updated (PATCH semantics).
+        If `ingredients` is provided, macros are recalculated synchronously
+        via overm-nutrition before the response is returned.
+      minProperties: 1
+      properties:
+        title:
+          type: string
+          minLength: 1
+        description:
+          type: string
+        ingredients:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Ingredient'
+        steps:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        servings:
+          type: integer
+          minimum: 1
+        tags:
+          type: array
+          items:
+            type: string
+
+    UploadResponse:
+      type: object
+      required: [upload_id, status]
+      description: |
+        Returned immediately on image upload — the transcription is async.
+        Poll GET /recipes/v1/upload/:upload_id or wait for the
+        `recipe.transcription.completed` Kafka event.
+      properties:
+        upload_id:
+          type: string
+          format: uuid
+          description: Track the transcription job with this ID
+          example: 018e1b3c-4f9a-7c2d-b1e8-aaaaaaaaaaaa
+        status:
+          type: string
+          enum: [pending]
+          example: pending
+        message:
+          type: string
+          example: Image received. You will be notified when transcription is complete.
+
+    UploadStatusResponse:
+      type: object
+      required: [upload_id, status]
+      properties:
+        upload_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, processing, completed, failed]
+          example: completed
+        recipe_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Populated when status is `completed` — the new recipe's ID
+          example: 018e1b3c-4f9a-7c2d-b1e8-3a9f6d012345
+        error:
+          type: string
+          nullable: true
+          description: Populated when status is `failed` — human-readable reason
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: UNAUTHORIZED
+            message: Token is missing or expired
+
+    ValidationError:
+      description: Request body failed validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: VALIDATION_ERROR
+            message: Request body is invalid
+            details:
+              ingredients: must have at least 1 item
+              servings: must be greater than 0
+
+    NotFound:
+      description: Recipe not found or belongs to a different user
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: RECIPE_NOT_FOUND
+            message: No recipe with id 'd290f1ee...' was found
+
+paths:
+
+  # ─────────────────────────────────────────────────────
+  # Recipe collection
+  # ─────────────────────────────────────────────────────
+
+  /recipes/v1:
+    get:
+      summary: List recipes for the authenticated user
+      operationId: listRecipes
+      tags: [Recipes]
+      description: |
+        Returns only `status: active` recipes by default.
+        Paginated. Supports title/description search and tag filtering.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: tags
+          in: query
+          description: Comma-separated list of tags to filter by (AND logic)
+          schema:
+            type: string
+          example: high-protein,quick
+        - name: q
+          in: query
+          description: Full-text search against title and description
+          schema:
+            type: string
+          example: chicken
+        - name: source
+          in: query
+          description: Filter by how the recipe was created
+          schema:
+            type: string
+            enum: [manual, transcribed]
+        - name: include_archived
+          in: query
+          description: Include soft-deleted recipes in results
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Paginated recipe list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipeListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      summary: Create a new recipe manually
+      operationId: createRecipe
+      tags: [Recipes]
+      description: |
+        Creates a recipe and immediately calls overm-nutrition to calculate macros.
+        Returns the full recipe including `macros_per_serving` in the 201 response.
+
+        Publishes `recipe.created` to Kafka after successful save.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRecipeRequest'
+            example:
+              title: Grilled chicken with veggies
+              description: Quick high-protein meal
+              ingredients:
+                - name: Chicken breast
+                  quantity: 200
+                  unit: g
+                - name: Broccoli
+                  quantity: 150
+                  unit: g
+              steps:
+                - Season chicken breast with salt and pepper
+                - Grill on medium heat for 6 minutes each side
+                - Steam broccoli for 5 minutes
+              servings: 2
+              tags: [high-protein, quick, gluten-free]
+      responses:
+        '201':
+          description: Recipe created — macros calculated and included
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Recipe'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Recipe with this title already exists for this user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: RECIPE_ALREADY_EXISTS
+                message: You already have a recipe titled 'Grilled chicken with veggies'
+
+  # ─────────────────────────────────────────────────────
+  # Single recipe
+  # ─────────────────────────────────────────────────────
+
+  /recipes/v1/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Recipe UUID v7
+
+    get:
+      summary: Get a single recipe by ID
+      operationId: getRecipe
+      tags: [Recipes]
+      description: |
+        Returns 404 if the recipe belongs to a different user —
+        never leak that another user's recipe exists.
+      responses:
+        '200':
+          description: Recipe found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Recipe'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      summary: Partially update a recipe
+      operationId: updateRecipe
+      tags: [Recipes]
+      description: |
+        Only provided fields are updated.
+        If `ingredients` or `servings` are updated, macros are recalculated
+        synchronously via overm-nutrition before the response is returned.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRecipeRequest'
+      responses:
+        '200':
+          description: Updated recipe — macros recalculated if ingredients changed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Recipe'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      summary: Soft-delete a recipe
+      operationId: deleteRecipe
+      tags: [Recipes]
+      description: |
+        Sets `status: archived`. The recipe is not hard-deleted.
+        It will no longer appear in list responses unless `include_archived=true`.
+        It will still be referenced correctly in historical menus.
+      responses:
+        '204':
+          description: Recipe archived — no content returned
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ─────────────────────────────────────────────────────
+  # Image upload — triggers async transcription
+  # ─────────────────────────────────────────────────────
+
+  /recipes/v1/upload:
+    post:
+      summary: Upload a recipe image for transcription
+      operationId: uploadRecipeImage
+      tags: [Upload]
+      description: |
+        Accepts an image of a handwritten or printed recipe.
+
+        The response is immediate — transcription is async.
+
+        What happens after this call:
+        1. Image is stored in S3
+        2. This service publishes `recipe.image.uploaded` to Kafka
+        3. overm-image-processing consumes the event, transcribes the image
+        4. overm-image-processing calls overm-nutrition for macros
+        5. Completed recipe is saved to MongoDB
+        6. `recipe.transcription.completed` is published to Kafka
+        7. Novu sends a notification to the user
+
+        Poll `GET /recipes/v1/upload/:upload_id` to check status,
+        or wait for the push notification.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+                  description: Image file — JPEG, PNG, WEBP, max 10MB
+                title_hint:
+                  type: string
+                  description: Optional — helps the AI model if it struggles with the handwriting
+                  example: Grandma's enchiladas
+      responses:
+        '202':
+          description: Image accepted — transcription queued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadResponse'
+        '400':
+          description: Invalid file type or size
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_FILE
+                message: File must be JPEG, PNG, or WEBP and under 10MB
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /recipes/v1/upload/{upload_id}:
+    get:
+      summary: Check the status of an image transcription job
+      operationId: getUploadStatus
+      tags: [Upload]
+      parameters:
+        - name: upload_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Transcription job status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadStatusResponse'
+              examples:
+                pending:
+                  value:
+                    upload_id: 018e1b3c-4f9a-7c2d-b1e8-aaaaaaaaaaaa
+                    status: pending
+                    recipe_id: null
+                completed:
+                  value:
+                    upload_id: 018e1b3c-4f9a-7c2d-b1e8-aaaaaaaaaaaa
+                    status: completed
+                    recipe_id: 018e1b3c-4f9a-7c2d-b1e8-3a9f6d012345
+                failed:
+                  value:
+                    upload_id: 018e1b3c-4f9a-7c2d-b1e8-aaaaaaaaaaaa
+                    status: failed
+                    recipe_id: null
+                    error: Could not read handwriting — image quality too low
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Upload job not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: UPLOAD_NOT_FOUND
+                message: No upload job with id 'abc...' was found
+
+  # ─────────────────────────────────────────────────────
+  # Internal
+  # ─────────────────────────────────────────────────────
+
+  /healthz:
+    get:
+      summary: Kubernetes liveness probe
+      operationId: healthCheck
+      tags: [Internal]
+      security: []
+      description: Returns 200 if the service is up. No auth required.
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: overm-recipe-catalog
