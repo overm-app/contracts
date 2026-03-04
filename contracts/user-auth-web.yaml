@@ -63,7 +63,7 @@ info:
     `POST /auth/v1/refresh` because the cookie path is `/auth/v1/refresh`.
     No request body needed — the cookie is the credential.
 
-  version: 1.0.0
+  version: 1.1.0
   contact:
     name: Mario Irigoyen
     url: https://github.com/Tar-Mairon24/overm-auth
@@ -104,7 +104,7 @@ components:
 
     User:
       type: object
-      required: [id, email, name, auth_provider, created_at]
+      required: [id, email, name, auth_provider, created_at, updated_at]
       properties:
         id:
           type: string
@@ -127,6 +127,11 @@ components:
         created_at:
           type: string
           format: date-time
+          description: When the user was created, set automatically by Postgres
+        updated_at:
+          type: string
+          format: date-time
+          description: When the user was last updated, set automatically by Postgres
 
     WebAuthResponse:
       type: object
