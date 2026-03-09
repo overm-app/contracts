@@ -51,8 +51,9 @@ info:
 
     1.0.0 - Initial contract
     1.0.1 - Add name of the service to the endpoints for better nomenclature, also in the health check response. No functional changes.
+    1.0.2 - Add total_pages to RecipeListResponse for better pagination support in the frontend. No functional changes.
 
-  version: 1.0.1
+  version: 1.0.2
   contact:
     name: Mario Irigoyen
     url: https://github.com/Tar-Mairon24/overm-recipe-catalog
@@ -204,10 +205,11 @@ components:
           $ref: '#/components/schemas/Macros'
         status:
           type: string
-          enum: [active, archived]
+          enum: [active, archived, deleted]
           description: |
-            Recipes are never hard-deleted.
-            archived = soft-deleted, excluded from list responses by default.
+            active = visible in catalog
+            archived = soft-deleted, recoverable
+            deleted = permanent, excluded everywhere
           example: active
         source:
           type: string
@@ -241,6 +243,10 @@ components:
         page_size:
           type: integer
           example: 20
+        total_pages:
+          type: integer
+          description: Total pages available based on total and page_size
+          example: 3
 
     CreateRecipeRequest:
       type: object
