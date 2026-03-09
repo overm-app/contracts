@@ -49,10 +49,12 @@ info:
     url: https://github.com/Tar-Mairon24/overm-auth
 
 servers:
-  - url: http://user-auth-svc:8081
-    description: Internal Kubernetes cluster DNS
-  - url: http://localhost:8081
-    description: Local docker-compose
+  - url: https://api.overm-app.io
+    description: Production — AWS EKS via ALB Ingress
+  - url: https://api.overm-minikube.io
+    description: Testing — Minikube via ALB Ingress
+  - url: http://localhost:8082
+    description: Local docker-compose (direct)
 
 tags:
   - name: Auth - Local
