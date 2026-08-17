@@ -1,0 +1,519 @@
+openapi: 3.0.3
+
+info:
+  title: overm-menu-shuffle
+  description: |
+    Generates and manages the authenticated user's weekly/monthly menu.
+
+    A menu is generated as a `draft`. The user must explicitly confirm it
+    before it becomes `active`. Confirming a draft archives whatever menu
+    was previously active — a user has at most one `active` menu at a time.
+
+    ---
+
+    ## MVP scope
+
+    Only `strategy: shuffle` (random selection, no repeats until the recipe
+    pool is exhausted) is implemented. `targets` and `filters` are accepted
+    and stored on the request but **not applied** — they exist so the schema
+    doesn't change when constrained generation ships. Do not build logic
+    against them yet.
+
+    ---
+
+    ## Auth
+
+    All endpoints require a valid JWT issued by `overm-auth`, validated
+    locally via the shared `AUTH_JWT_SECRET`. `user_id` is extracted from
+    the JWT `sub` claim — never from the request body.
+
+    ---
+
+    ## Recipe sourcing
+
+    `POST /menu/v1/generate` calls `overm-recipe-catalog`
+    (`GET /recipe-catalog/v1/recipes`) synchronously, forwarding the
+    caller's `Authorization` header as-is. This is a blocking HTTP call
+    because the user is waiting on the response — matches the project rule:
+    if the user is staring at a spinner, use HTTP, not Kafka.
+
+    If the user's active recipe count is lower than
+    `meals_per_day * days_in_range`, generation fails with
+    `INSUFFICIENT_RECIPES` rather than silently repeating recipes back to
+    back. Once the pool is exhausted mid-generation, repeats are allowed.
+
+    ---
+
+    ## One active menu per user
+
+    Enforced at the data layer via a partial unique index on
+    `{ user_id: 1, status: 1 }` where `status == "active"`. Confirming a
+    new menu is a single transaction: archive the current active menu (if
+    any), then activate the target draft. If the transaction fails, no
+    partial state is left behind.
+
+    ---
+
+    ## Changelog
+
+    1.0.0 - Initial contract
+
+  version: 1.0.0
+  contact:
+    name: Mario Irigoyen
+    url: https://github.com/Tar-Mairon24/overm-menu-shuffle
+
+servers:
+  - url: https://api.overm-app.io
+    description: Production — AWS EKS via ALB Ingress
+  - url: https://api.overm-minikube.io
+    description: Testing — Minikube via ALB Ingress
+  - url: http://localhost:8082
+    description: Local docker-compose (direct)
+
+tags:
+  - name: Menu
+    description: Menu generation, confirmation, and history
+  - name: Internal
+    description: Internal endpoints — not exposed via ALB Ingress
+
+security:
+  - BearerAuth: []
+
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT issued by overm-auth. Validated locally using `AUTH_JWT_SECRET`.
+
+        Expected claims:
+        ```
+        sub    (string uuid)  — user ID, used as menu owner
+        email  (string)       — user email
+        iat    (number)       — issued at (unix)
+        exp    (number)       — expiry (unix)
+        ```
+
+  schemas:
+
+    Error:
+      type: object
+      required: [code, message]
+      description: Standard error shape — same across all OVERM services
+      properties:
+        code:
+          type: string
+          example: INSUFFICIENT_RECIPES
+        message:
+          type: string
+          example: You need at least 21 active recipes for a full week at 3 meals/day, you have 12
+        details:
+          type: object
+          additionalProperties: true
+
+    MenuEntry:
+      type: object
+      required: [day, meal_slot, recipe_id, recipe_title]
+      properties:
+        day:
+          type: integer
+          minimum: 1
+          maximum: 31
+          description: Day index within the menu's time_range, 1-based
+          example: 1
+        meal_slot:
+          type: integer
+          minimum: 1
+          description: Meal index within the day, 1-based (order is not semantic — no breakfast/lunch/dinner labeling in MVP)
+          example: 1
+        recipe_id:
+          type: string
+          format: uuid
+          description: References a Recipe in overm-recipe-catalog
+        recipe_title:
+          type: string
+          description: |
+            Denormalized snapshot of the recipe title at generation time.
+            If the source recipe is later renamed or archived, this entry
+            still shows what was actually planned.
+          example: Grilled chicken with veggies
+
+    MenuTargets:
+      type: object
+      description: Accepted and stored, not applied in MVP. See contract description.
+      properties:
+        calories_per_day:
+          type: integer
+          nullable: true
+          example: null
+
+    MenuFilters:
+      type: object
+      description: Accepted and stored, not applied in MVP. See contract description.
+      properties:
+        max_prep_minutes:
+          type: integer
+          nullable: true
+          example: null
+        tags_excluded:
+          type: array
+          items:
+            type: string
+          example: []
+
+    Menu:
+      type: object
+      required: [id, user_id, status, time_range, meals_per_day, strategy, pinned_recipes, targets, filters, entries, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: UUID v4 generated by the service at creation time
+          example: d290f1ee-6c54-4b01-90e6-d701748f0851
+        user_id:
+          type: string
+          format: uuid
+          description: Menu owner — extracted from JWT sub claim
+        status:
+          type: string
+          enum: [draft, active, archived]
+          description: |
+            draft = generated, awaiting user confirmation.
+            active = the one menu currently in effect for this user.
+            archived = superseded by a later confirmed menu. Never hard-deleted.
+          example: draft
+        time_range:
+          type: string
+          enum: [week, month]
+          example: week
+        meals_per_day:
+          type: integer
+          minimum: 1
+          maximum: 6
+          example: 3
+        strategy:
+          type: string
+          enum: [shuffle]
+          description: Generation algorithm used. Only `shuffle` exists in MVP.
+          example: shuffle
+        pinned_recipes:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Ignored by the shuffle strategy in MVP. Always empty until constrained generation ships.
+          example: []
+        targets:
+          $ref: '#/components/schemas/MenuTargets'
+        filters:
+          $ref: '#/components/schemas/MenuFilters'
+        entries:
+          type: array
+          items:
+            $ref: '#/components/schemas/MenuEntry'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        confirmed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Set when status transitions draft -> active. Null for drafts and never re-set on archive.
+
+    GenerateMenuRequest:
+      type: object
+      required: [time_range, meals_per_day, strategy]
+      properties:
+        time_range:
+          type: string
+          enum: [week, month]
+        meals_per_day:
+          type: integer
+          minimum: 1
+          maximum: 6
+        strategy:
+          type: string
+          enum: [shuffle]
+        pinned_recipes:
+          type: array
+          items:
+            type: string
+            format: uuid
+          default: []
+        targets:
+          $ref: '#/components/schemas/MenuTargets'
+        filters:
+          $ref: '#/components/schemas/MenuFilters'
+
+    MenuListMeta:
+      type: object
+      required: [total, page, page_size, total_pages]
+      properties:
+        total:
+          type: integer
+          example: 8
+        page:
+          type: integer
+          example: 1
+        page_size:
+          type: integer
+          example: 20
+        total_pages:
+          type: integer
+          example: 1
+
+    MenuListResponse:
+      type: object
+      required: [data, meta]
+      description: |
+        Matches the real RecipeListResponse shape used by
+        overm-recipe-catalog (data + meta), not a flat pagination object.
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Menu'
+        meta:
+          $ref: '#/components/schemas/MenuListMeta'
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: UNAUTHORIZED
+            message: Token is missing or expired
+
+    ValidationError:
+      description: Request body failed validation
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: VALIDATION_ERROR
+            message: Request body is invalid
+            details:
+              meals_per_day: must be between 1 and 6
+
+    NotFound:
+      description: Menu not found or belongs to a different user
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: MENU_NOT_FOUND
+            message: No menu with id 'd290f1ee...' was found
+
+paths:
+
+  # ─────────────────────────────────────────────────────
+  # Generation
+  # ─────────────────────────────────────────────────────
+
+  /menu/v1/generate:
+    post:
+      summary: Generate a new draft menu
+      operationId: generateMenu
+      tags: [Menu]
+      description: |
+        Fetches the user's active recipes from overm-recipe-catalog
+        (forwarding the caller's Authorization header), shuffles them into
+        the requested slot count, and saves the result as `status: draft`.
+
+        Does not touch the currently active menu — the draft must be
+        confirmed via `PATCH /menu/v1/:id/confirm` before it replaces it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateMenuRequest'
+            example:
+              time_range: week
+              meals_per_day: 3
+              strategy: shuffle
+              pinned_recipes: []
+              targets:
+                calories_per_day: null
+              filters:
+                max_prep_minutes: null
+                tags_excluded: []
+      responses:
+        '201':
+          description: Draft menu created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Menu'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Not enough active recipes to fill every slot without excessive repetition
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INSUFFICIENT_RECIPES
+                message: You need at least 21 active recipes for a full week at 3 meals/day, you have 12
+        '502':
+          description: overm-recipe-catalog call failed or timed out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: RECIPE_CATALOG_UNAVAILABLE
+                message: Could not fetch recipes from overm-recipe-catalog
+
+  # ─────────────────────────────────────────────────────
+  # Active menu
+  # ─────────────────────────────────────────────────────
+
+  /menu/v1/active:
+    get:
+      summary: Get the user's current active menu
+      operationId: getActiveMenu
+      tags: [Menu]
+      responses:
+        '200':
+          description: The active menu
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Menu'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No active menu — nothing has been confirmed yet
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: NO_ACTIVE_MENU
+                message: You don't have an active menu yet
+
+  # ─────────────────────────────────────────────────────
+  # Confirmation
+  # ─────────────────────────────────────────────────────
+
+  /menu/v1/{id}/confirm:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+        description: Menu UUID v7 — must currently be status draft
+
+    patch:
+      summary: Confirm a draft menu, making it the active menu
+      operationId: confirmMenu
+      tags: [Menu]
+      description: |
+        Archives the current active menu (if any) and activates this draft
+        in a single transaction. Publishes `menu.activated` to Kafka on
+        success.
+      responses:
+        '200':
+          description: Menu confirmed and now active
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Menu'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Menu is not in draft status — already active or archived
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INVALID_MENU_STATUS
+                message: Only draft menus can be confirmed — this menu is archived
+
+  # ─────────────────────────────────────────────────────
+  # History
+  # ─────────────────────────────────────────────────────
+
+  /menu/v1/history:
+    get:
+      summary: List past menus for the authenticated user
+      operationId: listMenuHistory
+      tags: [Menu]
+      description: |
+        Returns `archived` menus by default, paginated, newest first.
+        Set `include_drafts=true` to also see abandoned drafts.
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: include_drafts
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Paginated menu history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MenuListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ─────────────────────────────────────────────────────
+  # Internal
+  # ─────────────────────────────────────────────────────
+
+  /menu/v1/healthz:
+    get:
+      summary: Kubernetes liveness probe
+      operationId: healthCheck
+      tags: [Internal]
+      security: []
+      description: Returns 200 if the service is up. No auth required.
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: overm-menu-shuffle
