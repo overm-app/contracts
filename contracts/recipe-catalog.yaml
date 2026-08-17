@@ -51,7 +51,7 @@ info:
 
     1.0.0 - Initial contract
     1.0.1 - Add name of the service to the endpoints for better nomenclature, also in the health check response. No functional changes.
-    1.0.2 - Add total_pages to RecipeListResponse for better pagination support in the frontend. No functional changes.
+    1.0.2 - Add total_pages to RecipeListResponse and nest pagination fields under meta object. No consumers exist yet.
 
   version: 1.0.2
   contact:
@@ -59,11 +59,13 @@ info:
     url: https://github.com/Tar-Mairon24/overm-recipe-catalog
 
 servers:
-  - url: http://recipe-catalog-svc:8082
-    description: Internal Kubernetes cluster DNS
+  - url: https://api.overm-app.io
+    description: Production — AWS EKS via ALB Ingress
+  - url: https://api.overm-minikube.io
+    description: Testing — Minikube via ALB Ingress
   - url: http://localhost:8082
-    description: Local docker-compose
-
+    description: Local docker-compose (direct)
+    
 tags:
   - name: Recipes
     description: Recipe CRUD operations
@@ -233,20 +235,24 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Recipe'
-        total:
-          type: integer
-          description: Total recipes matching the query — use for pagination UI
-          example: 42
-        page:
-          type: integer
-          example: 1
-        page_size:
-          type: integer
-          example: 20
-        total_pages:
-          type: integer
-          description: Total pages available based on total and page_size
-          example: 3
+        meta:
+          type: object
+          required: [total, page, page_size, total_pages]
+          properties:
+            total:
+              type: integer
+              description: Total recipes matching the query
+              example: 16
+            page:
+              type: integer
+              example: 1
+            page_size:
+              type: integer
+              example: 10
+            total_pages:
+              type: integer
+              example: 2
+        
 
     CreateRecipeRequest:
       type: object
