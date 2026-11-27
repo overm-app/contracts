@@ -17,50 +17,108 @@ info:
     ## JWT Contract (shared across all services)
 
     Every service validates tokens **locally** using the shared `AUTH_JWT_SECRET`
-    environment variable. No network call is made per request.
+    environment variable (at least 32 bytes). No network call is made per request.
+    Tokens are signed with HS256; any other algorithm is rejected.
 
     JWT payload shape:
     ```json
     {
+      "iss":   "overm-api-auth",
       "sub":   "user-uuid",
+      "sid":   "session-uuid",
       "email": "user@example.com",
       "name":  "Jane Smith",
       "iat":   1730000000,
-      "exp":   1730086400
+      "exp":   1730000900
     }
     ```
 
-    Token lifetime: **24 hours**.
-    Refresh tokens live **30 days** and are stored in Postgres, rotated on each use.
+    `sid` identifies the session (device) the token belongs to. New claims are
+    only ever added, never renamed or removed, so older consumers keep working.
+
+    ## Token lifetimes
+
+    Lifetimes are configuration, not part of this contract. They are set in the
+    service config file:
+
+    | Config key | Default | Applies to |
+    |---|---|---|
+    | `server.auth.access_token_ttl` | 15m | JWT `exp` claim |
+    | `server.auth.refresh_token_ttl` | 720h (30d) | Refresh token in Postgres |
+
+    Refresh tokens are stored in Postgres as a hash and rotated on each use.
+
+    **Clients must not hardcode these values.** Read the `exp` claim of the
+    access token, or react to a `401` by calling `POST /auth/v1/refresh` once and
+    retrying. Refresh calls must be single-flight: rotation invalidates the old
+    refresh token, so two concurrent refreshes with the same token will fail.
+
+    ---
+
+    ## Request headers
+
+    | Header | Required on | Purpose |
+    |---|---|---|
+    | `Authorization: Bearer <access_token>` | Authenticated endpoints | The access token |
+    | `X-Client-Type` | Optional | Any value other than `web` selects Bearer authentication. Mobile and API clients may omit it or send `api`. |
+    | `User-Agent` | Recommended | Recorded on the session. Mobile apps should send `overm-mobile/<version> (<os> <version>)`. |
+
+    Bearer requests do not need a CSRF token.
+
+    ---
+
+    ## Sessions
+
+    Every login, registration or Google sign-in creates a **session**: one per
+    device. A user can have several at once, and logging in on one device does
+    not end the others. Sessions record the `User-Agent`, an optional
+    `device_name` and timestamps. The `User-Agent` is informational and
+    client-controlled; it is never used to make an authorization decision.
+
+    **Device name.** Clients may label the session with a human-readable
+    `device_name` (for example "Mario's iPhone"). It is sent as an optional
+    field in the JSON body of `POST /auth/v1/register` and `POST /auth/v1/login`,
+    and as an optional query parameter on `GET /auth/v1/google` (the Google flow
+    is a browser navigation and cannot carry a body or custom headers). Values
+    longer than 64 characters are truncated and control characters are removed.
+    If it is omitted, the label is derived from the `User-Agent`.
+
+    - `GET /auth/v1/sessions` lists the user's sessions.
+    - `DELETE /auth/v1/sessions/{session_id}` revokes one.
+    - `DELETE /auth/v1/sessions` revokes all of them (log out everywhere).
+
+    A refresh token that was already rotated out and is presented again is
+    treated as stolen: the whole session is revoked.
 
     ---
 
     ## Google OAuth Flow (mobile / JSON mode)
 
-    1. App opens an in-app browser to `GET /auth/google?mode=json`
+    1. App opens an in-app browser to `GET /auth/v1/google?mode=json`
+       (optionally with `&device_name=<url-encoded name>`)
     2. User approves on Google
-    3. Google redirects to `GET /auth/google/callback?code=...&mode=json`
-    4. Service exchanges code, creates/finds user, issues JWT
+    3. Google redirects to `GET /auth/v1/google/callback?code=...&mode=json`
+    4. Service exchanges code, creates/finds user, creates a session, issues JWT
     5. Returns `AuthResponse` JSON directly — **no redirect**
 
-  version: 1.1.0
+  version: 1.3.0
   contact:
     name: Mario Irigoyen
     url: https://github.com/Tar-Mairon24/overm-auth
 
 servers:
-  - url: https://api.overm-app.io
-    description: Production — AWS EKS via ALB Ingress
-  - url: https://api.overm-minikube.io
-    description: Testing — Minikube via ALB Ingress
-  - url: http://localhost:8082
-    description: Local docker-compose (direct)
+  - url: http://user-auth-svc:8081
+    description: Internal Kubernetes cluster DNS
+  - url: http://localhost:8081
+    description: Local docker-compose
 
 tags:
   - name: Auth - Local
     description: Email and password authentication
   - name: Auth - Google OAuth
     description: Google OAuth 2.0 flow
+  - name: Sessions
+    description: List and revoke the user's sessions (devices)
   - name: Users
     description: Authenticated user profile
   - name: Internal
@@ -76,6 +134,28 @@ components:
       description: |
         Include the access_token from AuthResponse in every request:
         `Authorization: Bearer <access_token>`
+
+  parameters:
+
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+
+    Unauthorized:
+      description: Missing or invalid token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: UNAUTHORIZED
+            message: Missing or malformed Authorization header
 
   schemas:
 
@@ -129,6 +209,56 @@ components:
           format: date-time
           description: When the user was last updated, set automatically by Postgres
 
+    Session:
+      type: object
+      required: [id, client_type, created_at, last_used_at, current]
+      description: |
+        One login on one device or browser. The client IP is stored by the
+        service but is not exposed here.
+      properties:
+        id:
+          type: string
+          format: uuid
+        client_type:
+          type: string
+          enum: [web, api]
+        device_label:
+          type: string
+          nullable: true
+          description: |
+            The `device_name` if the client sent one, otherwise derived from the
+            User-Agent.
+          example: Mario's iPhone
+        browser:
+          type: string
+          nullable: true
+        os:
+          type: string
+          nullable: true
+          example: iOS 18
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          description: |
+            Updated when the session refreshes its tokens, not on every request,
+            so it is accurate to about the access token lifetime.
+        current:
+          type: boolean
+          description: True for the session the request's access token belongs to (`sid` claim)
+
+    SessionList:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          description: Ordered by `last_used_at`, newest first
+          items:
+            $ref: '#/components/schemas/Session'
+
     AuthResponse:
       type: object
       required: [access_token, refresh_token, user]
@@ -139,10 +269,15 @@ components:
       properties:
         access_token:
           type: string
-          description: Short-lived JWT (24h). Include in Authorization header.
+          description: |
+            Short-lived JWT. Lifetime is `server.auth.access_token_ttl`
+            (default 15 minutes) — read the `exp` claim, don't hardcode it.
+            Include in the Authorization header.
         refresh_token:
           type: string
-          description: Long-lived token (30 days). Use to get a new access_token.
+          description: |
+            Long-lived token. Lifetime is `server.auth.refresh_token_ttl`
+            (default 30 days). Use to get a new access_token.
         user:
           $ref: '#/components/schemas/User'
 
@@ -163,6 +298,12 @@ components:
           type: string
           minLength: 1
           example: Jane Smith
+        device_name:
+          type: string
+          description: |
+            Optional label for the session created by this request. Truncated
+            to 64 characters; control characters are removed.
+          example: Mario's iPhone
 
     LoginRequest:
       type: object
@@ -173,6 +314,12 @@ components:
           format: email
         password:
           type: string
+        device_name:
+          type: string
+          description: |
+            Optional label for the session created by this request. Truncated
+            to 64 characters; control characters are removed.
+          example: Mario's iPhone
 
     RefreshRequest:
       type: object
@@ -203,9 +350,10 @@ paths:
               email: jane@example.com
               password: mysecurepassword
               name: Jane Smith
+              device_name: Mario's iPhone
       responses:
         '201':
-          description: User created and logged in
+          description: User created, session created, logged in
           content:
             application/json:
               schema:
@@ -239,6 +387,8 @@ paths:
       description: |
         Returns the same error message whether the email doesn't exist
         or the password is wrong — prevents user enumeration.
+
+        Creates a new session. The user's other sessions stay active.
       requestBody:
         required: true
         content:
@@ -268,8 +418,14 @@ paths:
       operationId: refreshToken
       tags: [Auth - Local]
       description: |
-        Refresh tokens are rotated on every use — the old token is invalidated
-        and a new one is returned. Do not reuse a refresh token after calling this.
+        Refresh tokens are rotated on every use, inside the same session — the
+        old token is invalidated and a new one is returned. Do not reuse a
+        refresh token after calling this. Do not call this concurrently with the
+        same token.
+
+        If a refresh token that was already rotated out is presented again
+        (outside a short grace window for racing requests), the token is assumed
+        stolen and the **whole session is revoked**.
       requestBody:
         required: true
         content:
@@ -284,7 +440,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/AuthResponse'
         '401':
-          description: Refresh token invalid, expired, or already used
+          description: |
+            Refresh token invalid, expired, already used, or its session was
+            revoked
           content:
             application/json:
               schema:
@@ -295,14 +453,16 @@ paths:
 
   /auth/v1/logout:
     post:
-      summary: Invalidate the current refresh token
+      summary: Revoke the session of the given refresh token
       operationId: logout
       tags: [Auth - Local]
       security:
         - BearerAuth: []
       description: |
-        Deletes the refresh token from Postgres. The access token remains valid
-        until expiry (24h) — there is no server-side access token blocklist.
+        Revokes the session the refresh token belongs to; the user's other
+        sessions stay active. The access token remains valid until expiry
+        (`server.auth.access_token_ttl`, 15 minutes by default) — there is no
+        server-side access token blocklist.
         Clients must discard the access token themselves on logout.
       requestBody:
         required: true
@@ -312,9 +472,81 @@ paths:
               $ref: '#/components/schemas/RefreshRequest'
       responses:
         '204':
-          description: Logged out — refresh token revoked
+          description: Logged out — session revoked
         '401':
-          description: Not authenticated
+          $ref: '#/components/responses/Unauthorized'
+
+  # ───────────────────────────────────────────────────────
+  # Sessions
+  # ───────────────────────────────────────────────────────
+
+  /auth/v1/sessions:
+    get:
+      summary: List the authenticated user's sessions
+      operationId: listSessions
+      tags: [Sessions]
+      security:
+        - BearerAuth: []
+      description: The session the access token belongs to is marked `current: true`.
+      responses:
+        '200':
+          description: The user's sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    delete:
+      summary: Revoke all of the user's sessions (log out everywhere)
+      operationId: revokeAllSessions
+      tags: [Sessions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: except_current
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: Keep the session the access token belongs to
+      description: |
+        Deletes every session and its refresh tokens. Access tokens already
+        issued stay valid until they expire.
+      responses:
+        '204':
+          description: Sessions revoked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/v1/sessions/{session_id}:
+    delete:
+      summary: Revoke one session
+      operationId: revokeSession
+      tags: [Sessions]
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      description: |
+        A session id that does not exist, or belongs to another user, returns
+        `404` in both cases.
+      responses:
+        '204':
+          description: Session revoked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No such session for this user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: SESSION_NOT_FOUND
+                message: Session not found
 
   # ───────────────────────────────────────────────────────
   # Google OAuth — mobile / JSON mode
@@ -332,7 +564,9 @@ paths:
         Always pass `mode=json` so the callback returns JSON instead of a redirect.
 
         A random `state` parameter is generated server-side and stored in a
-        short-lived server session to prevent CSRF on the callback.
+        short-lived server session to prevent CSRF on the callback. The optional
+        `device_name` is stored with that state and read back in the callback,
+        because Google's redirect to the callback cannot carry it.
       parameters:
         - name: mode
           in: query
@@ -348,6 +582,15 @@ paths:
           schema:
             type: string
             example: overm://dashboard
+        - name: device_name
+          in: query
+          required: false
+          description: |
+            Optional label for the session created by this sign-in, URL-encoded.
+            Truncated to 64 characters; control characters are removed.
+          schema:
+            type: string
+            example: Mario's iPhone
       responses:
         '302':
           description: Redirect to Google consent screen
@@ -365,7 +608,8 @@ paths:
         2. Exchanges `code` for Google tokens server-to-server
         3. Calls Google's userinfo endpoint for email, name, avatar
         4. Upserts user in Postgres (`ON CONFLICT (email) DO UPDATE`)
-        5. Issues JWT + refresh token
+        5. Creates a session (using the `device_name` stored with the `state`,
+           if any) and issues JWT + refresh token
         6. Returns `AuthResponse` JSON (because `mode=json`)
 
         **Note:** Google users cannot log in with email/password and vice versa.
@@ -434,14 +678,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/User'
         '401':
-          description: Missing or invalid token
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-              example:
-                code: UNAUTHORIZED
-                message: No valid token provided
+          $ref: '#/components/responses/Unauthorized'
 
   # ───────────────────────────────────────────────────────
   # Internal endpoints — not exposed through ALB Ingress
@@ -476,7 +713,12 @@ paths:
               schema:
                 type: object
                 properties:
+                  iss:
+                    type: string
                   sub:
+                    type: string
+                    format: uuid
+                  sid:
                     type: string
                     format: uuid
                   email:
