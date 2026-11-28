@@ -7,7 +7,7 @@ info:
 
     Tokens are **never returned in the response body**.
     Instead the server sets `HttpOnly` cookies that JavaScript cannot read.
-    The browser attaches them automatically on every request to the same domain.
+    The browser attaches them automatically on every request to the same origin.
 
     > For **mobile apps and API clients** see `user-auth-api.yaml`.
     > That contract uses Bearer JWT in the response body.
@@ -18,21 +18,67 @@ info:
 
     JWTs stored in `localStorage` are readable by any JavaScript on the page,
     including scripts injected via XSS. HttpOnly cookies are inaccessible to
-    JavaScript entirely — only the browser sends them, and only to your domain.
+    JavaScript entirely — only the browser sends them, and only to your origin.
+
+    ---
+
+    ## Required request headers
+
+    | Header | Required on | Purpose |
+    |---|---|---|
+    | `X-Client-Type: web` | Every request to an authenticated endpoint, login, register, refresh and logout | Selects cookie authentication. Without it the service looks for a Bearer token and returns `401`. |
+    | `X-CSRF-Token` | `POST`, `PATCH`, `PUT`, `DELETE` | Must equal the `overm_csrf_token` cookie. See *CSRF Protection*. |
+
+    The Google OAuth endpoints are browser navigations and cannot carry custom
+    headers, so they do not require `X-Client-Type`.
+
+    ---
+
+    ## Token lifetimes
+
+    Lifetimes are configuration, not part of this contract. They are set in the
+    service config file:
+
+    | Config key | Default | Applies to |
+    |---|---|---|
+    | `server.auth.access_token_ttl` | 15m | JWT `exp` and the `overm_access_token` cookie |
+    | `server.auth.refresh_token_ttl` | 720h (30d) | Refresh token in Postgres, the `overm_refresh_token` cookie, and the `overm_csrf_token` cookie |
+
+    **Clients must not hardcode these values.** The access cookie is HttpOnly, so
+    the frontend cannot read its expiry. The only signal that it expired is a
+    `401` response — see *Client behavior* below.
 
     ---
 
     ## Cookies set on successful auth
 
-    | Cookie | HttpOnly | Secure | Path | MaxAge |
-    |---|---|---|---|---|
-    | `overm_access_token` | ✅ | ✅ | `/` | 24h |
-    | `overm_refresh_token` | ✅ | ✅ | `/auth/v1/refresh` | 30d |
-    | `overm_csrf_token` | ❌ | ✅ | `/` | 24h |
+    | Cookie | HttpOnly | Secure | SameSite | Path | Max-Age |
+    |---|---|---|---|---|---|
+    | `overm_access_token` | ✅ | ✅ (production) | Lax | `/` | `access_token_ttl` |
+    | `overm_refresh_token` | ✅ | ✅ (production) | Strict | `/auth/v1` | `refresh_token_ttl` |
+    | `overm_csrf_token` | ❌ | ✅ (production) | Lax | `/` | `refresh_token_ttl` |
+
+    Notes:
+
+    - `Secure` is only enabled in production (`server.cookie.secure`) so local
+      HTTP development works.
+    - `Domain` comes from `server.cookie.domain`. Empty means host-only.
+      It must be a bare hostname — no scheme, port, or path.
+    - The refresh cookie path is `/auth/v1` so the browser sends it to both
+      `POST /auth/v1/refresh` and `POST /auth/v1/logout` (logout needs it to
+      revoke the session server-side). It is not sent to the rest of the API.
+    - The access cookie uses `Lax`, not `Strict`: after the Google OAuth redirect
+      the browser lands on the frontend from a cross-site navigation, and
+      `Strict` cookies would not be sent on that first load.
+    - The CSRF cookie lives as long as the refresh cookie on purpose. It must
+      still exist when the access token has expired, because `POST /refresh`
+      requires the `X-CSRF-Token` header.
+    - Cookies are scoped by host, not port. On `localhost`, a cookie set by one
+      service port is also sent to the others.
 
     The `overm_csrf_token` is readable by JavaScript intentionally.
     Your frontend must read it and send it back as `X-CSRF-Token` header
-    on every mutating request (POST, PATCH, DELETE).
+    on every mutating request (POST, PATCH, PUT, DELETE).
     A third-party site cannot do this because it cannot read your cookies.
 
     ---
@@ -40,9 +86,56 @@ info:
     ## CSRF Protection
 
     All mutating endpoints require the `X-CSRF-Token` header.
-    The value must match the `overm_csrf_token` cookie.
+    The value must match the `overm_csrf_token` cookie (double-submit cookie).
+    A missing or mismatching value returns `403 CSRF_INVALID`.
 
     GET requests are exempt — they don't mutate state.
+
+    The token is not a secret and is bound to no user or session.
+    `GET /auth/v1/csrf` returns the current cookie value, or a new random one
+    if the cookie is missing. Every service that accepts the access cookie
+    performs the same check; no call to the auth service is needed.
+
+    ---
+
+    ## Sessions
+
+    Every login, registration or Google sign-in creates a **session**: one per
+    device or browser. A user can have several at once. Sessions record the
+    `User-Agent` (parsed into browser and OS), an optional `device_name`, and
+    timestamps. The `User-Agent` is informational and client-controlled; it is
+    never used to make an authorization decision.
+
+    **Device name.** A browser cannot know a device name, so web clients
+    normally omit it and the label is derived from the `User-Agent` (for
+    example "Chrome on Windows"). If the frontend lets the user name the
+    device, it sends `device_name` as an optional field in the JSON body of
+    `POST /auth/v1/register` or `POST /auth/v1/login`. Values longer than 64
+    characters are truncated and control characters are removed. The Google
+    sign-in flow does not carry a device name; its label always comes from the
+    `User-Agent`.
+
+    - `GET /auth/v1/sessions` lists the user's sessions.
+    - `DELETE /auth/v1/sessions/{session_id}` revokes one.
+    - `DELETE /auth/v1/sessions` revokes all of them (log out everywhere).
+
+    A refresh token that was already rotated out and is presented again is
+    treated as stolen: the whole session is revoked.
+
+    ---
+
+    ## Client behavior
+
+    1. Send requests normally with `X-Client-Type: web`. The browser attaches
+       the cookies.
+    2. On `401` from any endpoint, call `POST /auth/v1/refresh` **once**, then
+       retry the original request.
+    3. Refresh must be **single-flight**: if several requests fail with `401` at
+       the same time, only one refresh call is made and the others wait for it.
+       Refresh tokens rotate on every use, so concurrent refreshes with the same
+       token fail.
+    4. If `POST /auth/v1/refresh` returns `401`, the session is over. Send the
+       user to login. Do not retry.
 
     ---
 
@@ -51,7 +144,7 @@ info:
     1. Frontend redirects user to `GET /auth/v1/google` (no mode param needed)
     2. User approves on Google
     3. Google redirects to `GET /auth/v1/google/callback`
-    4. Service exchanges code, creates/finds user, issues JWT
+    4. Service exchanges code, creates/finds user, creates a session, issues JWT
     5. Sets HttpOnly cookies on the response
     6. Redirects browser to frontend — **no token in the URL ever**
 
@@ -60,27 +153,27 @@ info:
     ## Session Refresh
 
     The browser automatically sends `overm_refresh_token` when it calls
-    `POST /auth/v1/refresh` because the cookie path is `/auth/v1/refresh`.
-    No request body needed — the cookie is the credential.
+    `POST /auth/v1/refresh` because the request path falls under the cookie
+    path (`/auth/v1`). No request body needed — the cookie is the credential.
 
-  version: 1.1.0
+  version: 1.3.2
   contact:
     name: Mario Irigoyen
     url: https://github.com/Tar-Mairon24/overm-auth
 
 servers:
-  - url: https://api.overm-app.io
-    description: Production — AWS EKS via ALB Ingress
-  - url: https://api.overm-minikube.io
-    description: Testing — Minikube via ALB Ingress
-  - url: http://localhost:8082
-    description: Local docker-compose (direct)
+  - url: http://user-auth-svc:8081
+    description: Internal Kubernetes cluster DNS
+  - url: http://localhost:8081
+    description: Local docker-compose
 
 tags:
   - name: Auth - Local
     description: Email and password authentication
   - name: Auth - Google OAuth
     description: Google OAuth 2.0 flow — browser redirect mode
+  - name: Sessions
+    description: List and revoke the user's sessions (devices)
   - name: Users
     description: Authenticated user profile
   - name: Internal
@@ -135,6 +228,57 @@ components:
           format: date-time
           description: When the user was last updated, set automatically by Postgres
 
+    Session:
+      type: object
+      required: [id, client_type, created_at, last_used_at, current]
+      description: |
+        One login on one device or browser. The client IP is stored by the
+        service but is not exposed here.
+      properties:
+        id:
+          type: string
+          format: uuid
+        client_type:
+          type: string
+          enum: [web, api]
+        device_label:
+          type: string
+          nullable: true
+          description: |
+            The `device_name` if the client sent one, otherwise derived from the
+            User-Agent (for example "Chrome on Windows").
+          example: Chrome on Windows
+        browser:
+          type: string
+          nullable: true
+          example: Chrome 131
+        os:
+          type: string
+          nullable: true
+          example: Windows 11
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          description: |
+            Updated when the session refreshes its tokens, not on every request,
+            so it is accurate to about the access token lifetime.
+        current:
+          type: boolean
+          description: True for the session that made this request
+
+    SessionList:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          description: Ordered by `last_used_at`, newest first
+          items:
+            $ref: '#/components/schemas/Session'
+
     WebAuthResponse:
       type: object
       required: [user]
@@ -162,6 +306,12 @@ components:
         name:
           type: string
           minLength: 1
+        device_name:
+          type: string
+          description: |
+            Optional label for the session created by this request. Browsers
+            normally omit it. Truncated to 64 characters; control characters
+            are removed.
 
     LoginRequest:
       type: object
@@ -172,20 +322,60 @@ components:
           format: email
         password:
           type: string
+        device_name:
+          type: string
+          description: |
+            Optional label for the session created by this request. Browsers
+            normally omit it. Truncated to 64 characters; control characters
+            are removed.
 
     CsrfTokenResponse:
       type: object
       required: [csrf_token]
       description: |
-        A fresh CSRF token. Also set as the `overm_csrf_token` cookie.
+        The CSRF token. Also set as the `overm_csrf_token` cookie.
         Use this if the cookie has expired or on initial page load.
       properties:
         csrf_token:
           type: string
           description: Include this as the `X-CSRF-Token` header on all mutating requests
 
-  # CSRF header required on all mutating endpoints
+  responses:
+
+    CsrfInvalid:
+      description: CSRF token missing or not equal to the `overm_csrf_token` cookie
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: CSRF_INVALID
+            message: Missing or invalid CSRF
+
+    Unauthorized:
+      description: Session cookie missing, invalid, or expired
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            code: UNAUTHORIZED
+            message: Missing session cookie
+
   parameters:
+
+    ClientTypeHeader:
+      name: X-Client-Type
+      in: header
+      required: true
+      schema:
+        type: string
+        enum: [web]
+      description: |
+        Selects cookie authentication. Without it the service looks for a
+        Bearer token instead.
+
+    # CSRF header required on all mutating endpoints
     CsrfHeader:
       name: X-CSRF-Token
       in: header
@@ -195,7 +385,15 @@ components:
       description: |
         Value of the `overm_csrf_token` cookie.
         Read it with JavaScript and send it back in this header.
-        Required on POST, PATCH, DELETE. Not required on GET.
+        Required on POST, PATCH, PUT, DELETE. Not required on GET.
+
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
 
   # Cookie-based auth — described in headers, not securitySchemes,
   # because OpenAPI 3.0 doesn't model HttpOnly cookies well.
@@ -209,24 +407,26 @@ paths:
 
   /auth/v1/csrf:
     get:
-      summary: Get a fresh CSRF token
+      summary: Get the CSRF token
       operationId: getCsrfToken
       tags: [Auth - Local]
       description: |
-        Returns a new CSRF token as both a JSON response and a cookie.
-        Call this on initial page load if the `overm_csrf_token` cookie
-        is missing or expired.
+        Returns the CSRF token as both a JSON response and a cookie.
+        If the `overm_csrf_token` cookie already exists its value is returned
+        unchanged (the call is idempotent), otherwise a new random token is
+        created. Call this on initial page load if the cookie is missing or
+        expired. Unauthenticated; rate-limited at the edge.
 
         This is a GET — no CSRF header required.
       responses:
         '200':
-          description: Fresh CSRF token
+          description: CSRF token
           headers:
             Set-Cookie:
               description: Sets `overm_csrf_token` (NOT HttpOnly — JS must read it)
               schema:
                 type: string
-                example: overm_csrf_token=abc123; Secure; SameSite=Strict; Path=/
+                example: overm_csrf_token=abc123; Secure; SameSite=Lax; Path=/
           content:
             application/json:
               schema:
@@ -242,7 +442,12 @@ paths:
       operationId: registerWeb
       tags: [Auth - Local]
       parameters:
+        - $ref: '#/components/parameters/ClientTypeHeader'
         - $ref: '#/components/parameters/CsrfHeader'
+      description: |
+        Creates the user and a new session in one step, so no separate login
+        is needed afterwards. The email must not already be registered.
+        The three auth cookies are set on the response.
       requestBody:
         required: true
         content:
@@ -255,14 +460,15 @@ paths:
               name: Jane Smith
       responses:
         '201':
-          description: User created and logged in — tokens set as HttpOnly cookies
+          description: User created, session created, tokens set as HttpOnly cookies
           headers:
             Set-Cookie:
               description: |
-                Three cookies are set:
-                - `overm_access_token` (HttpOnly, 24h)
-                - `overm_refresh_token` (HttpOnly, 30d, path=/auth/v1/refresh)
-                - `overm_csrf_token` (readable by JS, 24h)
+                Three cookies are set (see the cookie table at the top for
+                attributes and lifetimes):
+                - `overm_access_token` (HttpOnly, `access_token_ttl`)
+                - `overm_refresh_token` (HttpOnly, `refresh_token_ttl`, path=/auth/v1)
+                - `overm_csrf_token` (readable by JS, `refresh_token_ttl`)
               schema:
                 type: string
           content:
@@ -280,6 +486,8 @@ paths:
                 message: Password must be at least 8 characters
                 details:
                   field: password
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
         '409':
           description: Email already registered
           content:
@@ -296,10 +504,13 @@ paths:
       operationId: loginWeb
       tags: [Auth - Local]
       parameters:
+        - $ref: '#/components/parameters/ClientTypeHeader'
         - $ref: '#/components/parameters/CsrfHeader'
       description: |
         Returns the same error whether the email doesn't exist or the password
         is wrong — prevents user enumeration.
+
+        Creates a new session. The user's other sessions stay active.
       requestBody:
         required: true
         content:
@@ -308,7 +519,7 @@ paths:
               $ref: '#/components/schemas/LoginRequest'
       responses:
         '200':
-          description: Login successful — tokens set as HttpOnly cookies
+          description: Login successful — session created, tokens set as HttpOnly cookies
           headers:
             Set-Cookie:
               description: Sets overm_access_token, overm_refresh_token, overm_csrf_token
@@ -327,6 +538,8 @@ paths:
               example:
                 code: INVALID_CREDENTIALS
                 message: Email or password is incorrect
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
 
   /auth/v1/refresh:
     post:
@@ -334,21 +547,29 @@ paths:
       operationId: refreshTokenWeb
       tags: [Auth - Local]
       parameters:
+        - $ref: '#/components/parameters/ClientTypeHeader'
         - $ref: '#/components/parameters/CsrfHeader'
       description: |
         **No request body needed.**
 
         The browser automatically sends the `overm_refresh_token` cookie
-        because this endpoint matches the cookie's path (`/auth/v1/refresh`).
+        because this endpoint falls under the cookie's path (`/auth/v1`).
 
-        The old refresh token is invalidated and a new one is set via cookie.
-        Refresh tokens are rotated on every use.
+        The old refresh token is invalidated and a new one is set via cookie,
+        inside the same session. Refresh tokens are rotated on every use, so
+        concurrent refresh calls must be avoided (see *Client behavior*).
+
+        If a refresh token that was already rotated out is presented again
+        (outside a short grace window for racing requests), the token is assumed
+        stolen and the **whole session is revoked**.
       responses:
         '200':
           description: New access token set as cookie — old refresh token invalidated
           headers:
             Set-Cookie:
-              description: Sets new overm_access_token and overm_refresh_token cookies
+              description: |
+                Sets new overm_access_token and overm_refresh_token cookies.
+                The overm_csrf_token value is kept; only its Max-Age is renewed.
               schema:
                 type: string
           content:
@@ -356,7 +577,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/WebAuthResponse'
         '401':
-          description: Refresh token cookie missing, expired, or already used
+          description: |
+            Refresh token cookie missing, expired, already used, or its session
+            was revoked
           content:
             application/json:
               schema:
@@ -364,32 +587,126 @@ paths:
               example:
                 code: INVALID_REFRESH_TOKEN
                 message: Refresh token is expired or has been revoked
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
 
   /auth/v1/logout:
     post:
-      summary: Log out — clear all auth cookies and revoke refresh token
+      summary: Log out — clear all auth cookies and revoke this session
       operationId: logoutWeb
       tags: [Auth - Local]
       parameters:
+        - $ref: '#/components/parameters/ClientTypeHeader'
         - $ref: '#/components/parameters/CsrfHeader'
       description: |
         **No request body needed.**
 
-        Clears all three cookies by setting them with `MaxAge=0`.
-        Also deletes the refresh token from Postgres.
+        Clears all three cookies by setting them with `MaxAge=0`, using the same
+        name, domain and path they were set with.
+        Also revokes the session of the presented refresh token in Postgres
+        (its other sessions stay active). The refresh cookie reaches this
+        endpoint because its path is `/auth/v1`.
 
-        The access token remains cryptographically valid until expiry (24h)
-        but the browser no longer has it — no blocklist needed.
+        The access token remains cryptographically valid until it expires
+        (`access_token_ttl`, 15 minutes by default) but the browser no longer has
+        it — no blocklist needed.
       responses:
         '204':
-          description: Logged out — all cookies cleared, refresh token revoked
+          description: Logged out — all cookies cleared, session revoked
           headers:
             Set-Cookie:
               description: All three cookies cleared (MaxAge=0)
               schema:
                 type: string
         '401':
-          description: Not authenticated — no valid session cookie
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
+
+  # ───────────────────────────────────────────────────────
+  # Sessions
+  # ───────────────────────────────────────────────────────
+
+  /auth/v1/sessions:
+    get:
+      summary: List the authenticated user's sessions
+      operationId: listSessionsWeb
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/ClientTypeHeader'
+      description: |
+        Auth is via the `overm_access_token` cookie.
+        The session making the request is marked `current: true`.
+      responses:
+        '200':
+          description: The user's sessions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    delete:
+      summary: Revoke all of the user's sessions (log out everywhere)
+      operationId: revokeAllSessionsWeb
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/ClientTypeHeader'
+        - $ref: '#/components/parameters/CsrfHeader'
+        - name: except_current
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: Keep the session that made this request
+      description: |
+        Deletes every session and its refresh tokens. Access tokens already
+        issued stay valid until they expire.
+        If the current session is revoked, its cookies are cleared as in logout.
+      responses:
+        '204':
+          description: Sessions revoked
+          headers:
+            Set-Cookie:
+              description: All three cookies cleared, unless `except_current=true`
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
+
+  /auth/v1/sessions/{session_id}:
+    delete:
+      summary: Revoke one session
+      operationId: revokeSessionWeb
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/ClientTypeHeader'
+        - $ref: '#/components/parameters/CsrfHeader'
+        - $ref: '#/components/parameters/SessionId'
+      description: |
+        Revoking the current session behaves like logout and clears the cookies.
+        A session id that does not exist, or belongs to another user, returns
+        `404` in both cases.
+      responses:
+        '204':
+          description: Session revoked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/CsrfInvalid'
+        '404':
+          description: No such session for this user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: SESSION_NOT_FOUND
+                message: Session not found
 
   # ───────────────────────────────────────────────────────
   # Google OAuth — browser redirect mode
@@ -407,6 +724,8 @@ paths:
         server-side session or signed cookie to prevent CSRF on the callback.
 
         No `mode` parameter here — the web contract always uses redirect mode.
+        This is a navigation, so no custom headers are sent, and no device name
+        is accepted: the session label is derived from the `User-Agent`.
       parameters:
         - name: redirect_after
           in: query
@@ -431,7 +750,7 @@ paths:
         2. Exchanges `code` for Google tokens (server-to-server)
         3. Calls Google's userinfo endpoint for email, name, avatar
         4. Upserts user in Postgres (`ON CONFLICT (email) DO UPDATE`)
-        5. Issues JWT and refresh token
+        5. Creates a session and issues JWT and refresh token
         6. Sets all three cookies on the response
         7. Redirects browser to the original `redirect_after` path
 
@@ -488,6 +807,8 @@ paths:
       summary: Get the authenticated user's profile
       operationId: getMeWeb
       tags: [Users]
+      parameters:
+        - $ref: '#/components/parameters/ClientTypeHeader'
       description: |
         Auth is via the `overm_access_token` cookie — sent automatically by the browser.
         No Authorization header needed.
