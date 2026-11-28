@@ -749,7 +749,7 @@ paths:
         1. Validates the `state` param (CSRF protection)
         2. Exchanges `code` for Google tokens (server-to-server)
         3. Calls Google's userinfo endpoint for email, name, avatar
-        4. Upserts user in Postgres (`ON CONFLICT (email) DO UPDATE`)
+        4. Inserts user in Postgres (`ON CONFLICT (email) DO UPDATE`)
         5. Creates a session and issues JWT and refresh token
         6. Sets all three cookies on the response
         7. Redirects browser to the original `redirect_after` path
