@@ -10,6 +10,7 @@ services:
           {"url": "/contracts/user-auth-api.yaml",  "name": "Auth API (internal/mobile)"},
           {"url": "/contracts/user-auth-web.yaml",  "name": "Auth Web (browser)"},
           {"url": "/contracts/recipe-catalog.yaml", "name": "Recipe Catalog"},
+          {"url": "/contracts/menu-shuffle.yaml",   "name": "Menu Shuffle"}
         ]
     volumes:
       - ./contracts:/usr/share/nginx/html/contracts:ro
@@ -18,5 +19,4 @@ services:
 
 networks:
   overm-network:
-    external: true 
-
+    external: true
