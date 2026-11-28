@@ -101,7 +101,7 @@ info:
     4. Service exchanges code, creates/finds user, creates a session, issues JWT
     5. Returns `AuthResponse` JSON directly — **no redirect**
 
-  version: 1.3.0
+  version: 1.3.1
   contact:
     name: Mario Irigoyen
     url: https://github.com/Tar-Mairon24/overm-auth
